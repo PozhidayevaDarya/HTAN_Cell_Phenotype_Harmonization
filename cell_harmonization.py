@@ -11,12 +11,16 @@ import celltypist
 
 from celltypist import models
 import glob
-import subprocess
+import shutil
 
 def get_ensembl_synonyms(ensembl_list):
     '''
     Get symbols for ensembl Ids 
     '''
+    print('')
+    print('Getting gene synonyms, this may take some time...')
+    print('')
+    
     my_gene = mygene.MyGeneInfo()
     gene_list = list()
     #clean ensemble if needed
@@ -65,13 +69,13 @@ def run_adata_processing(adata_object):
     sc.tl.pca(adata_object, svd_solver='arpack')
     sc.pp.neighbors(adata_object, n_neighbors=10, n_pcs=40)
     sc.tl.umap(adata_object)
-    # Impltemenet cell typist and save the outputs to ann data object
+    # Implement cell typist and save the outputs to ann data object
     predictions=celltypist.annotate(adata_object, model = cell_typist_model, mode = 'best match', p_thres = cell_typist_probability_threshold, majority_voting = True)
     adata_object = predictions.to_adata()
     
-    return adata_object
+    return adata_object 
 
-if __name__ == '__main__':   
+def main():
     #Directory Managment
     current_directory = os.getcwd()
     dir_10x = 'Temp_Data/10xformat'
@@ -82,18 +86,28 @@ if __name__ == '__main__':
         if not os.path.exists(dir):
             os.makedirs(dir)
         
-    #syn = synapseclient.Synapse()
-    #try:
-        #syn.login()
-    #except synapseclient.core.exceptions.SynapseNoCredentialsError:
-    #    print("Please ensure 'username' and 'password'/'api_key' \
-    #        are filled out in .synapseConfig.")
-    #except synapseclient.core.exceptions.SynapseAuthenticationError:
-    #    print("Please make sure the credentials in the .synapseConfig file are correct.")
+    #Initiate synapse client
+    syn = synapseclient.Synapse()
+    try:
+        syn.login()
+    except synapseclient.core.exceptions.SynapseNoCredentialsError:
+        print("Please ensure 'username' and 'password'/'api_key' \
+            are filled out in .synapseConfig.")
+    except synapseclient.core.exceptions.SynapseAuthenticationError:
+        print("Please make sure the credentials in the .synapseConfig file are correct.")
         
-    # instantiate google bigquery client
-    client = bigquery.Client.from_service_account_json("htan-dcc-ccc1ca71c3a3.json")
-    
+    #Initiate google bigquery client
+    try:
+		client = bigquery.Client()
+		print('BigQuery client successfully initialized')
+	except:
+		print('Failure to initialize BigQuery client')
+        
+
+    #Query for data
+    print('')
+    print('Running query in BQ')
+    print('')
     data_query = client.query("""
     SELECT DISTINCT T1.entityId, T1.HTAN_Center, T1.Filename, T1.File_Format, T1.scRNAseq_Workflow_Parameters_Description, T1.Cell_Total, T1.Matrix_Type, T1.Component, T1.HTAN_Data_File_ID, T1.Data_Release, T2.HTAN_Participant_ID, T2.HTAN_Assayed_Biospecimen_ID, 
     T3.Tissue_or_Organ_of_Origin, T4.Tumor_Tissue_Type  FROM `htan-dcc.combined_assays.ScRNA-seqLevel3` AS T1
@@ -120,35 +134,76 @@ if __name__ == '__main__':
     # Process all the files by type and biospecimen id
     for ids, biospecimen, filename, fileformat in zip(files_by_biospecimen.entityId, files_by_biospecimen.HTAN_Assayed_Biospecimen_ID, files_by_biospecimen.Filename, files_by_biospecimen.File_Format):
         
-        if 'gzip' in fileformat and all(x == fileformat[0] for x in fileformat) and len(fileformat) >= 3:
-            if [v for v in filename if 'barcodes' in v] and [v for v in filename if 'features' in v]:
+        #Assumption for formatting 10x SC files
+        if 'gzip' in fileformat and all(f == fileformat[0] for f in fileformat) and len(fileformat) >= 3:
+            #10x files are comprised of usually 3 items: features, barcodes, matrix
+            if [substring for substring in filename if 'barcodes' in substring] and [substring for substring in filename if 'features' in substring]:
+                #Download files
                 for id in ids:
+                    print('Fetching data')
                     syn.get(id, downloadLocation="Temp_Data/10xformat")
-            #ASSUMPTION
+            
+            #Take care of the prefix names and create ann data object
             file_listing = os.listdir("Temp_Data/10xformat")
             prefix = re.match("(.*?)_", file_listing[0]).group()
-            current_adata = sc.read_10x_mtx("Temp_Data/10xformat", prefix = prefix)
-            current_adata.layers["raw"] = current_adata.X.copy()
-            run_adata_processing(current_adata)
-            current_adata.write_h5ad(prefix + "_harmonized_cell.h5ad")
-            for f in file_listing:
-                os.remove("Temp_Data/10xformat/"+f)
+            adata_10x = sc.read_10x_mtx("Temp_Data/10xformat", prefix = prefix)
+            adata_10x.layers["raw"] = adata_10x.X.copy()
+            print('')
+            print('Running Adata Processing Step')
+            print('')
+            run_adata_processing(adata_10x)
+            #write to h5ad format
+            print('')
+            print('Writing h5ad File')
+            print('')
+            adata_10x.write_h5ad("Harmonized_h5ad/" + prefix + "_harmonized_cell.h5ad")
+            #Delete current files after finished to save memory
+            for file in file_listing:
+                os.remove("Temp_Data/10xformat/" + file)
+            print('')
+            print(filename, ' File Processed')
+            print('')
         
-        if 'csv' in fileformat and all(x == fileformat[0] for x in fileformat):
+        #Assumption for csv file types - 1 file per sample (ish)
+        if 'csv' in fileformat and all(f == fileformat[0] for f in fileformat):
+            #Download files
             for id in ids:
+                print('Fetching data')
                 syn.get(id, downloadLocation="Temp_Data/csvformat")
+            #Get files
             file_listing = os.listdir("Temp_Data/csvformat")
             for file in file_listing:
-                current_adata = pd.read_csv("Temp_Data/csvformat/" + file, header=0, index_col=0)
-                ens_dict = get_ensembl_synonyms(current_adata.index)
-                ens_dict = ens_dict.set_index('original_ensembl_ids')
-                mat = pd.merge(current_adata, ens_dict, left_index=True, right_index=True)
-                mat = mat.set_index('returned_symbol')
-                mat = mat.drop(columns=['clean_ensembl_ids', 'queried_ensembl'])
-                adata = sc.AnnData(mat.transpose())
+                pd_current_file = pd.read_csv("Temp_Data/csvformat/" + file, header=0, index_col=0)
+                #Turn ensembl ids into symbols
+                ens_output = get_ensembl_synonyms(pd_current_file.index)
+                ens_output = ens_output.set_index('original_ensembl_ids')
+                csv_mat = pd.merge(pd_current_file, ens_output, left_index=True, right_index=True)
+                csv_mat = csv_mat.set_index('returned_symbol')
+                csv_mat = csv_mat.drop(columns=['clean_ensembl_ids', 'queried_ensembl'])
+                
+                adata_csv = sc.AnnData(csv_mat.transpose())
                 # convert the pandas table to a sparse matrix
-                adata.X = sparse.csr_matrix(adata.X)
-                adata.layers["raw"] = adata.X.copy()
-                run_adata_processing(adata)
-                adata.write_h5ad(file + "harmonized_cell.h5ad")
+                adata_csv.X = sparse.csr_matrix(adata_csv.X)
+                adata_csv.layers["raw"] = adata_csv.X.copy()
+                print('')
+                print('Running Adata Processing Step')
+                print('')
+                run_adata_processing(adata_csv)
+                print('')
+                print('Writing h5ad File')
+                print('')
+                adata_csv.write_h5ad(file + "harmonized_cell.h5ad")
                 os.remove("Temp_Data/csvformat/" + file )
+            print('')
+            print(filename,' File Processed')
+            print('')
+            
+    shutil.rmtree('Temp_Data')
+    print('')
+    print('Data harmonization is complete')
+    print('')
+    
+##
+if __name__ == "__main__":
+
+	main()
